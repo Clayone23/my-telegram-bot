@@ -183,7 +183,7 @@ def chat(message):
     system_prompt = ROLES.get(state["role"], ROLES["default"])
 
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
+        model_name="gemini-2.0-flash",
         system_instruction=system_prompt
     )
 
@@ -215,7 +215,7 @@ def photo(message):
 
     try:
         uploaded = genai.upload_file(tmp_path)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         caption = message.caption or "Опиши подробно, что на этом фото. Если есть текст — прочитай его."
         resp = model.generate_content([caption, uploaded])
         bot.edit_message_text(resp.text, uid, processing.message_id, parse_mode="Markdown")
@@ -275,7 +275,7 @@ def doc(message):
     processing = bot.reply_to(message, f"📄 Читаю {fname}...")
     try:
         uploaded = genai.upload_file(tmp_path)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = f"Проанализируй файл {fname}. Если CSV — опиши данные и предложи анализ. Если текст — перескажи суть."
         resp = model.generate_content([prompt, uploaded])
         bot.edit_message_text(resp.text, uid, processing.message_id, parse_mode="Markdown")
