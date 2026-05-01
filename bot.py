@@ -31,7 +31,7 @@ def main_keyboard():
     kb.add("💻 Программист", "🤖 Обычный")
     kb.add("🎭 Роли", "🖼 Картинка")
     kb.add("🧠 СуперИИ", "🔍 Поиск")
-    kb.add("🎤 Голос")
+    kb.add("🎤 Голос", "🧹 Очистить")
     return kb
 
 def roles_keyboard():
@@ -55,17 +55,10 @@ def run_health():
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
     server.serve_forever()
 
-def ask_groq(system_prompt, user_text):
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text}
-        ],
-        temperature=0.7,
-        max_tokens=2048
-    )
-    return response.choices[0].message.content
+def describe_image_base64(image_path):
+    with open(image_path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:image/jpeg;base64,{image_data}"
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -130,6 +123,25 @@ def nav_roles(m):
 def nav_back(m):
     bot.reply_to(m, "Главное меню:", reply_markup=main_keyboard())
 
+@bot.message_handler(func=lambda m: m.text == "🧹 Очистить")
+def nav_clear(m):
+    uid = m.chat.id
+    if uid in user_states:
+        user_states[uid]["history"] = []
+    bot.reply_to(m, "История диалога очищена.")
+
+@bot.message_handler(func=lambda m: m.text == "🖼 Картинка")
+def nav_img(m):
+    bot.reply_to(m, "Отправь описание — сгенерирую.\nОтправь фото — проанализирую.\nИли /img <описание>")
+
+@bot.message_handler(func=lambda m: m.text == "🔍 Поиск")
+def nav_search(m):
+    bot.reply_to(m, "Напиши что найти или /internet <запрос>")
+
+@bot.message_handler(func=lambda m: m.text == "🎤 Голос")
+def nav_voice(m):
+    bot.reply_to(m, "Отправь голосовое сообщение — переведу в текст.")
+
 role_btns = ["👨‍🏫 Учитель", "🧑‍💻 Программист", "🧠 Психолог", "🦸 СуперИИ", "✍️ Копирайтер", "🔥 Критик", "🤖 Обычный"]
 role_map = {
     "👨‍🏫 Учитель": "teacher", "🧑‍💻 Программист": "programmer",
@@ -174,9 +186,6 @@ def chat(message):
 @bot.message_handler(content_types=['photo'])
 def photo(message):
     uid = message.chat.id
-    if uid not in user_states:
-        user_states[uid] = {"role": "default", "history": []}
-
     processing = bot.reply_to(message, "Анализирую фото...")
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded = bot.download_file(file_info.file_path)
@@ -186,17 +195,18 @@ def photo(message):
         tmp_path = tmp.name
 
     try:
-        with open(tmp_path, "rb") as f:
-            image_data = base64.b64encode(f.read()).decode("utf-8")
+        image_b64 = describe_image_base64(tmp_path)
+
+        user_text = message.caption or "Опиши подробно, что на этом изображении."
 
         response = client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview",
+            model="llama-3.2-90b-vision-preview",
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": message.caption or "Опиши подробно это изображение."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": image_b64}}
                     ]
                 }
             ],
