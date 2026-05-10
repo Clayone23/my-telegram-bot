@@ -1,4 +1,4 @@
-# bot.py
+# bot.py (фрагмент изменений)
 import os
 import json
 import threading
@@ -8,6 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 import requests
+import httpx  # ← добавить импорт
 from groq import Groq
 from duckduckgo_search import DDGS
 
@@ -18,7 +19,15 @@ if not TELEGRAM_TOKEN or not GROQ_KEY:
     raise RuntimeError("Missing TELEGRAM_TOKEN or GROQ_KEY env vars")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-groq_client = Groq(api_key=GROQ_KEY)
+
+# === ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ GROQ ===
+groq_client = Groq(
+    api_key=GROQ_KEY,
+    http_client=httpx.Client(
+        timeout=60.0,
+        follow_redirects=True
+    )
+)
 
 # === Хранилище истории (in-memory) ===
 user_histories = {}       # user_id -> list of messages
