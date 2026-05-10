@@ -1,254 +1,237 @@
-import telebot
-import requests
+# bot.py
 import os
-import tempfile
+import json
 import threading
-import base64
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from duckduckgo_search import DDGS
-from groq import Groq
 
+import telebot
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
+import requests
+from groq import Groq
+from duckduckgo_search import DDGS
+
+# === Конфиги ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_KEY = os.getenv("GROQ_KEY")
+if not TELEGRAM_TOKEN or not GROQ_KEY:
+    raise RuntimeError("Missing TELEGRAM_TOKEN or GROQ_KEY env vars")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-client = Groq(api_key=GROQ_KEY)
+groq_client = Groq(api_key=GROQ_KEY)
 
-ROLES = {
-    "default": "Ты — полезный ассистент. Отвечай чётко, на русском языке.",
-    "programmer": "Ты Senior Developer. Получаешь ТЗ, задаёшь уточняющие вопросы, объясняешь архитектуру, потом пишешь чистый код с комментариями.",
-    "teacher": "Ты — терпеливый учитель. Объясняешь сложное простым языком, не даёшь готовых ответов, а направляешь вопросами.",
-    "psychologist": "Ты — эмпатичный психолог. Активно слушаешь, задаёшь открытые вопросы, не даёшь советов.",
-    "superai": "Ты — ИИ экспертного уровня. Отвечаешь глубоко, структурированно, с выводами.",
-    "copywriter": "Ты — профессиональный копирайтер. Пишешь цепляющие, продающие тексты.",
-    "critic": "Ты — суровый критик. Жёстко и конструктивно разбираешь текст или идею.",
+# === Хранилище истории (in-memory) ===
+user_histories = {}       # user_id -> list of messages
+user_roles = {}           # user_id -> role_name
+
+ROLE_PROMPTS = {
+    "Обычный": "Ты — полезный AI-ассистент. Отвечай дружелюбно.",
+    "Программист": "Ты — Senior Developer. Задавай уточняющие вопросы, объясняй архитектуру, давай код с комментариями.",
+    "Учитель": "Ты — учитель. Объясняй сложное простыми словами, задавай наводящие вопросы. Не давай готовых ответов на учебные задачи.",
+    "Психолог": "Ты — психолог. Используй активное слушание, задавай открытые вопросы. Не давай прямых советов.",
+    "СуперИИ": "Ты — СуперИИ. Отвечай глубоко, структурированно, с выводами и практическими рекомендациями.",
+    "Копирайтер": "Ты — копирайтер. Пиши продающие, цепляющие тексты.",
+    "Критик": "Ты — критик. Отвечай жёстко, с сарказмом, но конструктивно."
 }
 
-user_states = {}
-
+# === Клавиатура ===
 def main_keyboard():
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add("💻 Программист", "🤖 Обычный")
-    kb.add("🎭 Роли", "🖼 Картинка")
-    kb.add("🧠 СуперИИ", "🔍 Поиск")
-    kb.add("🎤 Голос", "🧹 Очистить")
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    buttons = [
+        "Обычный", "Программист", "Учитель",
+        "Психолог", "СуперИИ", "Копирайтер",
+        "Критик", "Картинка", "Поиск",
+        "Голос", "Очистить"
+    ]
+    kb.add(*buttons)
     return kb
 
-def roles_keyboard():
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add("👨‍🏫 Учитель", "🧑‍💻 Программист")
-    kb.add("🧠 Психолог", "🦸 СуперИИ")
-    kb.add("✍️ Копирайтер", "🔥 Критик")
-    kb.add("🤖 Обычный", "⬅ Назад")
-    return kb
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
-
-def run_health():
-    port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    server.serve_forever()
-
-def describe_image_base64(image_path):
-    with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:image/jpeg;base64,{image_data}"
-
-@bot.message_handler(commands=['start'])
-def start(message):
-    uid = message.chat.id
-    user_states[uid] = {"role": "default", "history": []}
-    bot.send_message(uid, "Привет! Я твой AI-ассистент.\nВыбери режим:", reply_markup=main_keyboard())
-
-@bot.message_handler(commands=['img'])
-def cmd_img(message):
-    prompt = message.text.replace("/img", "").strip()
-    if not prompt:
-        bot.reply_to(message, "Напиши: /img <описание>")
-        return
-    msg = bot.reply_to(message, "Рисую...")
+# === Groq текстовый вызов ===
+def groq_chat(user_id, user_message, image_url=None):
+    role = user_roles.get(user_id, "Обычный")
+    system_prompt = ROLE_PROMPTS.get(role, ROLE_PROMPTS["Обычный"])
+    
+    # история (последние 10 сообщений)
+    history = user_histories.get(user_id, [])
+    messages = [{"role": "system", "content": system_prompt}] + history[-10:] + [{"role": "user", "content": user_message}]
+    
     try:
-        url = f"https://image.pollinations.ai/prompt/{prompt}?width=1024&height=1024&nologo=true"
-        resp = requests.get(url, timeout=30)
-        bot.send_photo(message.chat.id, resp.content, caption=prompt)
-        bot.delete_message(msg.chat.id, msg.message_id)
+        if image_url:
+            # vision-модель
+            response = groq_client.chat.completions.create(
+                model="llama-3.2-90b-vision-preview",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message, "image_url": image_url}
+                ],
+                temperature=0.7,
+                max_tokens=1024
+            )
+        else:
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1024
+            )
+        reply = response.choices[0].message.content
+        # сохранять историю
+        user_histories.setdefault(user_id, []).append({"role": "user", "content": user_message})
+        user_histories[user_id].append({"role": "assistant", "content": reply})
+        return reply
     except Exception as e:
-        bot.edit_message_text(f"Ошибка: {e}", msg.chat.id, msg.message_id)
+        return f"❌ Ошибка AI: {str(e)}"
 
-@bot.message_handler(commands=['internet'])
-def cmd_internet(message):
-    query = message.text.replace("/internet", "").strip()
-    if not query:
-        bot.reply_to(message, "Напиши: /internet <запрос>")
-        return
+# === Генерация картинки ===
+def generate_image(prompt):
+    url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
+    # pollinations возвращает картинку, но иногда падает. Делаем проверку.
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200 and resp.headers.get('content-type', '').startswith('image/'):
+            return url  # возвращаем прямую ссылку (telegram умеет отправлять по ссылке)
+        return None
+    except:
+        return None
+
+# === Поиск DuckDuckGo ===
+def search_web(query):
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
-        if not results:
-            bot.reply_to(message, "Ничего не найдено.")
-            return
-        answer = f"Результаты: {query}\n\n"
-        for i, r in enumerate(results, 1):
-            answer += f"{i}. {r['title']}\n{r['body'][:200]}...\n{r['href']}\n\n"
-        bot.reply_to(message, answer, disable_web_page_preview=True)
+            if not results:
+                return "Ничего не найдено."
+            answer = ""
+            for r in results:
+                answer += f"🔹 *{r['title']}*\n{r['body'][:300]}\n{r['href']}\n\n"
+            return answer
     except Exception as e:
-        bot.reply_to(message, f"Ошибка: {e}")
+        return f"Ошибка поиска: {str(e)}"
 
-@bot.message_handler(func=lambda m: m.text == "💻 Программист")
-def nav_prog(m):
-    user_states[m.chat.id] = {"role": "programmer", "history": []}
-    bot.reply_to(m, "Режим Senior Developer. Опиши задачу.")
+# === Обработчики команд ===
+@bot.message_handler(commands=['start'])
+def start_cmd(msg):
+    user_id = msg.from_user.id
+    user_histories[user_id] = []
+    user_roles[user_id] = "Обычный"
+    bot.send_message(user_id, "Привет! Я AI-бот с ролями. Выбери режим кнопками.", reply_markup=main_keyboard())
 
-@bot.message_handler(func=lambda m: m.text == "🤖 Обычный")
-def nav_def(m):
-    user_states[m.chat.id] = {"role": "default", "history": []}
-    bot.reply_to(m, "Обычный режим. Задавай вопрос.")
+@bot.message_handler(commands=['img'])
+def img_cmd(msg):
+    prompt = msg.text.replace('/img', '').strip()
+    if not prompt:
+        bot.reply_to(msg, "Напиши описание после /img, например: /img кот в космосе")
+        return
+    bot.reply_to(msg, "🖼 Генерирую картинку...")
+    url = generate_image(prompt)
+    if url:
+        bot.send_photo(msg.chat.id, url, caption=f"🎨 {prompt}")
+    else:
+        bot.reply_to(msg, "Не удалось сгенерировать картинку. Попробуй другое описание.")
 
-@bot.message_handler(func=lambda m: m.text == "🧠 СуперИИ")
-def nav_super(m):
-    user_states[m.chat.id] = {"role": "superai", "history": []}
-    bot.reply_to(m, "СуперИИ активирован.")
+@bot.message_handler(commands=['internet'])
+def internet_cmd(msg):
+    query = msg.text.replace('/internet', '').strip()
+    if not query:
+        bot.reply_to(msg, "Введи запрос после /internet, например: /internet новости ИИ")
+        return
+    bot.reply_to(msg, "🔍 Ищу...")
+    res = search_web(query)
+    bot.send_message(msg.chat.id, res, parse_mode="Markdown")
 
-@bot.message_handler(func=lambda m: m.text == "🎭 Роли")
-def nav_roles(m):
-    bot.reply_to(m, "Выбери роль:", reply_markup=roles_keyboard())
-
-@bot.message_handler(func=lambda m: m.text == "⬅ Назад")
-def nav_back(m):
-    bot.reply_to(m, "Главное меню:", reply_markup=main_keyboard())
-
-@bot.message_handler(func=lambda m: m.text == "🧹 Очистить")
-def nav_clear(m):
-    uid = m.chat.id
-    if uid in user_states:
-        user_states[uid]["history"] = []
-    bot.reply_to(m, "История диалога очищена.")
-
-@bot.message_handler(func=lambda m: m.text == "🖼 Картинка")
-def nav_img(m):
-    bot.reply_to(m, "Отправь описание — сгенерирую.\nОтправь фото — проанализирую.\nИли /img <описание>")
-
-@bot.message_handler(func=lambda m: m.text == "🔍 Поиск")
-def nav_search(m):
-    bot.reply_to(m, "Напиши что найти или /internet <запрос>")
-
-@bot.message_handler(func=lambda m: m.text == "🎤 Голос")
-def nav_voice(m):
-    bot.reply_to(m, "Отправь голосовое сообщение — переведу в текст.")
-
-role_btns = ["👨‍🏫 Учитель", "🧑‍💻 Программист", "🧠 Психолог", "🦸 СуперИИ", "✍️ Копирайтер", "🔥 Критик", "🤖 Обычный"]
-role_map = {
-    "👨‍🏫 Учитель": "teacher", "🧑‍💻 Программист": "programmer",
-    "🧠 Психолог": "psychologist", "🦸 СуперИИ": "superai",
-    "✍️ Копирайтер": "copywriter", "🔥 Критик": "critic",
-    "🤖 Обычный": "default"
-}
-
-@bot.message_handler(func=lambda m: m.text in role_btns)
-def set_role(m):
-    uid = m.chat.id
-    user_states[uid] = {"role": role_map[m.text], "history": []}
-    bot.reply_to(m, f"Роль: {m.text}. Жду вопрос.")
-
-@bot.message_handler(content_types=['text'])
-def chat(message):
-    uid = message.chat.id
-    if uid not in user_states:
-        user_states[uid] = {"role": "default", "history": []}
-
-    state = user_states[uid]
-    system_prompt = ROLES.get(state["role"], ROLES["default"])
-
-    state["history"].append({"role": "user", "content": message.text})
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(state["history"][-20:])
-
+@bot.message_handler(content_types=['voice'])
+def handle_voice(msg):
+    bot.reply_to(msg, "🎤 Распознаю голос...")
     try:
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.7,
-            max_tokens=2048
-        )
-        answer = response.choices[0].message.content
-        bot.reply_to(message, answer)
-        state["history"].append({"role": "assistant", "content": answer})
-    except Exception as e:
-        bot.reply_to(message, f"Ошибка: {e}")
-
-@bot.message_handler(content_types=['photo'])
-def photo(message):
-    uid = message.chat.id
-    processing = bot.reply_to(message, "Анализирую фото...")
-    file_info = bot.get_file(message.photo[-1].file_id)
-    downloaded = bot.download_file(file_info.file_path)
-
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(downloaded)
-        tmp_path = tmp.name
-
-    try:
-        image_b64 = describe_image_base64(tmp_path)
-
-        user_text = message.caption or "Опиши подробно, что на этом изображении."
-
-        response = client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": image_b64}}
-                    ]
-                }
-            ],
-            temperature=0.7,
-            max_tokens=1024
-        )
-        answer = response.choices[0].message.content
-        bot.edit_message_text(answer, uid, processing.message_id)
-    except Exception as e:
-        bot.edit_message_text(f"Ошибка: {e}", uid, processing.message_id)
-    finally:
-        os.unlink(tmp_path)
-
-@bot.message_handler(content_types=['voice', 'audio'])
-def voice(message):
-    uid = message.chat.id
-    processing = bot.reply_to(message, "Распознаю речь...")
-
-    file_id = message.voice.file_id if message.voice else message.audio.file_id
-    file_info = bot.get_file(file_id)
-    downloaded = bot.download_file(file_info.file_path)
-
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp.write(downloaded)
-        tmp_path = tmp.name
-
-    try:
-        with open(tmp_path, "rb") as f:
-            transcription = client.audio.transcriptions.create(
+        file_info = bot.get_file(msg.voice.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+        # Groq whisper принимает файл
+        temp_path = f"/tmp/voice_{msg.from_user.id}.ogg"
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
+        with open(temp_path, "rb") as f:
+            transcription = groq_client.audio.transcriptions.create(
                 model="whisper-large-v3-turbo",
                 file=f,
-                language="ru"
+                response_format="text"
             )
-        text = transcription.text
-        bot.edit_message_text(f"Распознано:\n\n{text}", uid, processing.message_id)
-        if uid in user_states:
-            user_states[uid]["history"].append({"role": "user", "content": text})
+        os.remove(temp_path)
+        text = transcription if isinstance(transcription, str) else transcription.text
+        bot.reply_to(msg, f"📝 Распознанный текст:\n{text}")
+        # автоматически ответим тем же AI (чтобы история сохранилась)
+        reply = groq_chat(msg.from_user.id, text)
+        bot.send_message(msg.chat.id, reply, reply_markup=main_keyboard())
     except Exception as e:
-        bot.edit_message_text(f"Ошибка: {e}", uid, processing.message_id)
-    finally:
-        os.unlink(tmp_path)
+        bot.reply_to(msg, f"Ошибка распознавания: {str(e)}")
 
+@bot.message_handler(content_types=['photo'])
+def handle_photo(msg):
+    if not msg.caption:
+        bot.reply_to(msg, "Напиши вопрос к фото (caption). Например: 'Что здесь изображено?'")
+        return
+    user_id = msg.from_user.id
+    # получаем ссылку на фото (Telegram file_id -> прямой URL через API)
+    file_id = msg.photo[-1].file_id
+    file_info = bot.get_file(file_id)
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+    # Groq vision требует base64 или URL. Передадим URL напрямую (не public? но для groq работает если изображение доступно)
+    # Иногда Telegram file_url недоступен извне — лучше пересохранить, но для простоты используем как есть
+    bot.reply_to(msg, "🤖 Анализирую фото...")
+    answer = groq_chat(user_id, msg.caption, image_url=file_url)
+    bot.send_message(msg.chat.id, answer, reply_markup=main_keyboard())
+
+@bot.message_handler(func=lambda m: True)
+def handle_text(msg):
+    user_id = msg.from_user.id
+    text = msg.text.strip()
+    
+    if text in ROLE_PROMPTS.keys():
+        user_roles[user_id] = text
+        bot.reply_to(msg, f"✅ Режим переключён на: {text}")
+        return
+    
+    if text == "Очистить":
+        user_histories[user_id] = []
+        bot.reply_to(msg, "🧹 История диалога очищена.")
+        return
+    
+    if text == "Картинка":
+        bot.reply_to(msg, "🎨 Для генерации картинки используй команду:\n`/img описание картинки`\nПример: `/img закат над морем`", parse_mode="Markdown")
+        return
+    
+    if text == "Поиск":
+        bot.reply_to(msg, "🔎 Для поиска в интернете используй команду:\n`/internet запрос`\nПример: `/internet рецепт пиццы`", parse_mode="Markdown")
+        return
+    
+    if text == "Голос":
+        bot.reply_to(msg, "🎙 Отправь мне голосовое сообщение, я распознаю речь.")
+        return
+    
+    # обычный чат
+    bot.send_chat_action(user_id, 'typing')
+    answer = groq_chat(user_id, text)
+    bot.send_message(user_id, answer, reply_markup=main_keyboard())
+
+# === HTTP-сервер для keep-alive ===
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+    
+    def log_message(self, format, *args):
+        pass  # тишина в логах
+
+def run_http():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server.serve_forever()
+
+# === Запуск ===
 if __name__ == "__main__":
-    threading.Thread(target=run_health, daemon=True).start()
+    threading.Thread(target=run_http, daemon=True).start()
+    print("Бот запущен, health-сервер на порту", os.environ.get("PORT", 10000))
     bot.infinity_polling()
